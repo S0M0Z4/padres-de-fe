@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ruta de los Padres de Fe</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body class="desert">
+  <div class="screen">
+    <header class="top">
+      <div class="logo">
+        <strong>🛤️ Ruta de los Padres de Fe</strong>
+        <span>Trivia bíblica · Día del Padre</span>
+      </div>
+      <div class="pin">PIN <b id="pin">583921</b></div>
+    </header>
+
+    <main class="main-full">
+      <section class="main">
+        <div id="stage" class="stage-pill">🌵 Desierto</div>
+        <div id="view" class="view"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal" class="modal">
+    <div class="modal-box" id="modalBox"></div>
+  </div>
+
+<script type="module">
+import { db, ref, onValue } from "./js/firebase-config.js";
+import { QUESTIONS } from "./js/questions.js";
+import { PIN, q, optionLabel, rank, medal, secondsLeft, stageByIndex, playerUrl } from "./js/shared.js";
+
+const view = document.getElementById("view");
+const stageEl = document.getElementById("stage");
+const modal = document.getElementById("modal");
+const modalBox = document.getElementById("modalBox");
+document.getElementById("pin").textContent = PIN;
+
+let game = { state: "lobby", currentIndex: 0 };
+let players = {};
+let answers = {};
+let results = {};
+let screenKey = "";
+let counterKey = "";
+let pendingGame = null;
+let boardAnimKey = "";
+
+// Hora corregida con Firebase.
+// El index no inicia temporizadores propios: solo muestra lo que Firebase indica.
+let serverOffset = 0;
+function syncedNow(){
+  return Date.now() + serverOffset;
+}
+function syncedSecondsLeft(target){
+  return Math.max(0, Math.ceil(((target || syncedNow()) - syncedNow()) / 1000));
+}
+
+function setStage(index=0){
+  const s = stageByIndex(index);
+  document.body.classList.remove("desert","jerusalem","heaven");
+  document.body.classList.add(s.key);
+  stageEl.textContent = `${s.icon} ${s.name}`;
+}
+
+function roadHTML(){
+  const cells = QUESTIONS.map((_,i)=>{
+    const s = stageByIndex(i);
+    return `<div class="cell ${s.key}">
+      <div class="num">${i+1}</div>
+      <div class="tokens" id="cell-${i+1}"></div>
+    </div>`;
+  }).join("");
+  return `<div class="road">${cells}</div>`;
+}
+
+function drawTokens(list, moving=false){
+  document.querySelectorAll(".tokens").forEach(el => el.innerHTML = "");
+  (list || []).forEach(p=>{
+    const pos = Math.max(0, Math.min(QUESTIONS.length, p.position || 0));
+    const el = document.getElementById("cell-" + pos);
+    if(!el) return;
+    const t = document.createElement("div");
+    t.className = moving ? "token move" : "token";
+    t.title = p.name;
+    t.style.background = p.color || "#fff";
+    el.appendChild(t);
+  });
+}
+
+function playersAsPositions(){
+  return Object.entries(players).map(([id,p])=>({id, name:p.name, color:p.color, position:p.position || 0}));
+}
+
+function setView(key, html, anim="fade-up"){
+  if(screenKey === key) return false;
+  screenKey = key;
+  counterKey = "";
+  view.innerHTML = `<div class="${anim}">${html}</div>`;
+  return true;
+}
+
+function showModal(html){
+  modalBox.innerHTML = html;
+  modal.classList.remove("closing");
+  modal.classList.add("show");
+}
+
+function closeModal(callback){
+  if(!modal.classList.contains("show")){
+    callback();
+    return;
+  }
+  modal.classList.add("closing");
+  setTimeout(()=>{
+    modal.classList.remove("show","closing");
+    callback();
+  }, 430);
+}
+
+function lobby(){
+  modal.classList.remove("show","closing");
+  const url = playerUrl();
+  const qr = `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(url)}`;
+  const list = rank(players);
+  setView("lobby-"+list.length, `
+    <div class="lobby">
+      <div>
+        <h1 class="big-title">Bienvenidos a la Ruta de Fe</h1>
+        <p class="sub">Escanea el QR para entrar como pareja padre e hija.</p>
+        <div class="players" style="margin-top:18px;">
+          ${list.length ? list.map(p=>`<div class="player-row"><span class="dot" style="background:${p.color||"#fff"}"></span><strong>${p.name}</strong></div>`).join("") : `<div class="notice">Aún no hay parejas conectadas.</div>`}
+        </div>
+      </div>
+      <div class="qr-card"><img src="${qr}" alt="QR"><div>player.html</div></div>
+    </div>
+  `,"fade-up");
+}
+
+function countdown(){
+  modal.classList.remove("show","closing");
+  const question = game.questionData || q(game.currentIndex);
+  const left = syncedSecondsLeft(game.questionStartsAt);
+  setView("countdown-"+game.currentIndex, `
+    <div class="countdown">
+      <div>
+        <h1>Siguiente pregunta</h1>
+        <p class="sub">Pregunta ${(game.currentIndex||0)+1} · ${question?.category||"Biblia"}</p>
+        <div id="countNumber" class="n">${left}</div>
+      </div>
+    </div>
+  `,"fade-up");
+  if(counterKey !== "c"+left){
+    counterKey = "c"+left;
+    const el = document.getElementById("countNumber");
+    if(el) el.textContent = left;
+  }
+}
+
+function question(){
+  modal.classList.remove("show","closing");
+  const question = game.questionData || q(game.currentIndex);
+  const left = syncedSecondsLeft(game.answerEndsAt);
+  const current = answers?.[game.currentIndex] || {};
+  const totalPlayers = Object.keys(players).length;
+  const answerCount = Object.keys(current).length;
+
+  const options = question.type === "boolean"
+    ? `<div class="options"><div class="opt v"><b>V</b> Verdadero</div><div class="opt f"><b>F</b> Falso</div></div>`
+    : `<div class="options">${["A","B","C","D"].map(k=>`<div class="opt ${k.toLowerCase()}"><b>${k}</b> ${question.options[k]}</div>`).join("")}</div>`;
+
+  setView("question-"+game.currentIndex, `
+    <div class="question">
+      <div class="category">Pregunta ${(game.currentIndex||0)+1} de ${QUESTIONS.length} · ${question.category}</div>
+      <h1>${question.question}</h1>
+      ${options}
+      <div id="qTimer" class="timer">⏳ ${left}</div>
+      <div id="qAnswers" class="answer-count">Respuestas: ${answerCount}/${totalPlayers}</div>
+    </div>
+  `,"slide-left");
+
+  const k = `q${left}-${answerCount}-${totalPlayers}`;
+  if(counterKey !== k){
+    counterKey = k;
+    const t = document.getElementById("qTimer");
+    const a = document.getElementById("qAnswers");
+    if(t) t.textContent = `⏳ ${left}`;
+    if(a) a.textContent = `Respuestas: ${answerCount}/${totalPlayers}`;
+  }
+}
+
+function resultsModalOnly(){
+  const question = game.questionData || q(game.currentIndex);
+  const r = results?.[game.currentIndex] || {};
+  const rows = r.rows || [];
+
+  setView("results-wait-"+game.currentIndex, `
+    <div class="countdown">
+      <div>
+        <h1>📖 Respuesta revelada</h1>
+        <p class="sub">El moderador cerrará la ventana de resultados.</p>
+      </div>
+    </div>
+  `,"fade-up");
+
+  showModal(`
+    <div class="modal-title">🏆 Resultados de la ronda</div>
+    <div class="correct">Correcta: <span style="color:#facc15">${question.correct}) ${optionLabel(question, question.correct)}</span><br><span style="font-size:22px;color:#d1d5db">${question.verse || ""}</span></div>
+    ${rows.length ? rows.map(row=>`
+      <div class="result ${row.correct ? "ok" : "bad"}">
+        <div>${row.correct ? medal((row.correctOrder||1)-1) : "❌"}</div>
+        <div>${row.name}</div>
+        <div>${row.answer}) ${row.answerLabel}</div>
+        <div>${row.correct ? "+"+row.points : "0"} pts</div>
+      </div>
+    `).join("") : `<div class="notice">Nadie respondió esta pregunta.</div>`}
+    <p style="text-align:center;font-weight:900;color:#d1d5db;">El moderador debe presionar “Cerrar modal”.</p>
+  `);
+}
+
+function board(){
+  modal.classList.remove("show","closing");
+  const r = results?.[game.currentIndex] || {};
+  const before = r.positionsBefore || playersAsPositions();
+  const after = r.positionsAfter || playersAsPositions();
+  const key = "board-"+game.currentIndex;
+
+  const changed = setView(key, `
+    <div class="board-card">
+      <div class="board-heading">
+        <div>
+          <h1>🗺️ La ruta avanza</h1>
+          <p>Los colores se mueven a la siguiente casilla.</p>
+        </div>
+        <div class="stage-pill">${stageByIndex(game.currentIndex).icon} ${stageByIndex(game.currentIndex).name}</div>
+      </div>
+      ${roadHTML()}
+    </div>
+  `,"map-in");
+
+  if(changed || boardAnimKey !== key){
+    boardAnimKey = key;
+    drawTokens(before, false);
+    setTimeout(()=>drawTokens(after, true), 850);
+  }
+}
+
+function finalScreen(){
+  modal.classList.remove("show","closing");
+  const list = rank(players);
+  const top = list.slice(0,3);
+  const victory = game.finalType === "victory";
+  setStage(QUESTIONS.length-1);
+
+  setView("final", `
+    <div class="final">
+      <div class="final-box">
+        <div class="final-title">${victory ? "🏆 Llegaron a la Meta" : "📖 Fin de la Travesía"}</div>
+        <p class="sub">${victory ? `${top[0]?.name || "Un equipo"} llegó a la Ciudad Celestial. “Bien, buen siervo y fiel.” Mateo 25:23` : `Aunque nadie alcanzó la meta, todos avanzaron en conocimiento y fe. “Prosigo a la meta...” Filipenses 3:14`}</p>
+
+        <div class="podium">
+          <div class="podium-card"><div style="font-size:48px">🥈</div><div>${top[1]?.name || "—"}</div><div>${top[1]?.score || 0} pts</div></div>
+          <div class="podium-card first"><div style="font-size:64px">🥇</div><div>${top[0]?.name || "—"}</div><div>${top[0]?.score || 0} pts</div></div>
+          <div class="podium-card"><div style="font-size:48px">🥉</div><div>${top[2]?.name || "—"}</div><div>${top[2]?.score || 0} pts</div></div>
+        </div>
+
+        <div class="final-ranking">
+          ${list.map((p,i)=>`
+            <div class="rank-row">
+              <span>${medal(i)}</span>
+              <span class="dot" style="background:${p.color || "#fff"}"></span>
+              <strong>${p.name}</strong>
+              <span class="points">${p.score || 0} pts</span>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+    </div>
+  `,"fade-up");
+}
+
+function render(){
+  setStage(game.currentIndex || 0);
+
+  const state = game.state || "lobby";
+  if(state === "lobby") lobby();
+  else if(state === "countdown") countdown();
+  else if(state === "question") question();
+  else if(state === "results") resultsModalOnly();
+  else if(state === "board") board();
+  else if(state === "finished") finalScreen();
+  else lobby();
+}
+
+onValue(ref(db,".info/serverTimeOffset"), snap=>{
+  serverOffset = snap.val() || 0;
+  render();
+});
+
+onValue(ref(db,"game"), snap=>{
+  const nextGame = snap.val() || {state:"lobby", currentIndex:0};
+
+  if((game.state || "") === "results" && nextGame.state === "board"){
+    pendingGame = nextGame;
+    closeModal(()=>{
+      game = pendingGame;
+      pendingGame = null;
+      screenKey = "";
+      render();
+    });
+    return;
+  }
+
+  game = nextGame;
+  screenKey = "";
+  render();
+});
+
+onValue(ref(db,"players"), snap=>{
+  players = snap.val() || {};
+  if(["lobby","board","finished"].includes(game.state || "")){
+    screenKey = "";
+    render();
+  }
+});
+
+onValue(ref(db,"answers"), snap=>{
+  answers = snap.val() || {};
+  if((game.state || "") === "question") render();
+});
+
+onValue(ref(db,"results"), snap=>{
+  results = snap.val() || {};
+  if(["results","board"].includes(game.state || "")){
+    screenKey = "";
+    render();
+  }
+});
+
+setInterval(render, 250);
+</script>
+</body>
+</html>

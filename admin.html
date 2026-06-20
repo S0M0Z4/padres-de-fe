@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Moderador · Ruta de Fe</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body class="admin-body">
+  <div class="admin-wrap">
+    <header class="top" style="border-radius:24px;margin-bottom:18px;">
+      <div class="logo">
+        <strong>🎛️ Moderador</strong>
+        <span>Ruta de los Padres de Fe</span>
+      </div>
+      <div class="pin">PIN <b>583921</b></div>
+    </header>
+
+    <div class="admin-grid">
+      <section>
+        <div class="card">
+          <h2>Control del juego</h2>
+          <div class="btns">
+            <button class="btn-green" id="lobby">Abrir lobby</button>
+            <button class="btn-blue" id="start">Iniciar</button>
+            <button class="btn-gold" id="reveal">Revelar y puntuar</button>
+            <button class="btn-dark" id="closeModal">Cerrar modal</button>
+            <button class="btn-purple" id="continue">Continuar</button>
+            <button class="btn-red" id="finish">Finalizar</button>
+          </div>
+          <p class="small">Flujo: revelar → modal de resultados → cerrar modal → ver movimiento en tablero → continuar → contador de 3 segundos.</p>
+        </div>
+
+        <div class="card">
+          <h2>Pregunta actual</h2>
+          <div id="questionInfo" class="notice">Cargando...</div>
+        </div>
+
+        <div class="card">
+          <h2>Respuestas recibidas</h2>
+          <div id="answerList" class="answer-list"></div>
+        </div>
+      </section>
+
+      <section>
+        <div class="card">
+          <h2>Participantes</h2>
+          <div id="playerList" class="players"></div>
+        </div>
+
+        <div class="card">
+          <h2>Estado</h2>
+          <div id="stateInfo" class="notice">Cargando...</div>
+        </div>
+
+        <div class="card">
+          <h2>Reiniciar</h2>
+          <button class="btn-red" id="reset">Borrar todo</button>
+          <p class="small">Esto borra jugadores, respuestas, resultados y puntajes.</p>
+        </div>
+      </section>
+    </div>
+  </div>
+
+<script type="module">
+import { db, ref, set, get, update, remove, onValue } from "./js/firebase-config.js";
+import { QUESTIONS } from "./js/questions.js";
+import { PIN, COUNTDOWN_SECONDS, QUESTION_SECONDS, COLORS, pointsFor, q, optionLabel, rank, medal } from "./js/shared.js";
+
+let game = { state:"lobby", currentIndex:0 };
+let players = {};
+let answers = {};
+
+// Hora corregida con Firebase.
+// El admin escribe questionStartsAt y answerEndsAt UNA sola vez.
+// Index y player solo leen esos valores.
+let serverOffset = 0;
+function syncedNow(){
+  return Date.now() + serverOffset;
+}
+
+const playerList = document.getElementById("playerList");
+const answerList = document.getElementById("answerList");
+const questionInfo = document.getElementById("questionInfo");
+const stateInfo = document.getElementById("stateInfo");
+
+async function openLobby(){
+  await set(ref(db,"game"),{
+    pin: PIN,
+    state:"lobby",
+    currentIndex:0,
+    totalQuestions: QUESTIONS.length,
+    updatedAt: Date.now()
+  });
+  await remove(ref(db,"answers"));
+  await remove(ref(db,"results"));
+}
+
+async function resetAll(){
+  if(!confirm("¿Seguro que quieres borrar todo?")) return;
+  await remove(ref(db,"players"));
+  await remove(ref(db,"answers"));
+  await remove(ref(db,"results"));
+  await set(ref(db,"game"),{
+    pin: PIN,
+    state:"lobby",
+    currentIndex:0,
+    totalQuestions: QUESTIONS.length,
+    updatedAt: Date.now()
+  });
+}
+
+async function startCountdown(index){
+  const question = q(index);
+  if(!question) return finishGame();
+
+  await remove(ref(db,`answers/${index}`));
+
+  const now = syncedNow();
+
+  // FUENTE ÚNICA DE TIEMPO:
+  // El contador de 3 segundos y el contador de pregunta se calculan aquí una sola vez.
+  // Player e index NO crean duración propia; solo leen questionStartsAt y answerEndsAt.
+  const questionStartsAt = now + COUNTDOWN_SECONDS * 1000;
+  const answerEndsAt = questionStartsAt + QUESTION_SECONDS * 1000;
+
+  await update(ref(db,"game"),{
+    pin: PIN,
+    state:"countdown",
+    currentIndex:index,
+    questionData: question,
+    questionStartsAt,
+    answerEndsAt,
+    countdownSeconds: COUNTDOWN_SECONDS,
+    questionSeconds: QUESTION_SECONDS,
+    totalQuestions: QUESTIONS.length,
+    updatedAt: syncedNow()
+  });
+
+  setTimeout(async()=>{
+    const snap = await get(ref(db,"game"));
+    const current = snap.val() || {};
+    if(current.state === "countdown" && current.currentIndex === index){
+      // IMPORTANTE:
+      // Solo cambiamos el estado. NO recalculamos answerEndsAt.
+      // Así se evita que el player cree un contador propio o diferente.
+      await update(ref(db,"game"),{
+        state:"question",
+        updatedAt:syncedNow()
+      });
+    }
+  }, COUNTDOWN_SECONDS * 1000 + 120);
+}
+
+async function startGame(){
+  const snap = await get(ref(db,"players"));
+  if(!snap.exists()) return alert("Todavía no hay participantes.");
+
+  const currentPlayers = snap.val() || {};
+  const updates = {};
+
+  Object.keys(currentPlayers).forEach((id,i)=>{
+    updates[`players/${id}/score`] = 0;
+    updates[`players/${id}/position`] = 0;
+    updates[`players/${id}/color`] = currentPlayers[id].color || COLORS[i % COLORS.length];
+  });
+
+  await update(ref(db), updates);
+  await remove(ref(db,"answers"));
+  await remove(ref(db,"results"));
+  await startCountdown(0);
+}
+
+async function revealAndScore(){
+  const gameSnap = await get(ref(db,"game"));
+  const g = gameSnap.val() || {};
+  if(g.state !== "question") return alert("No hay una pregunta activa.");
+
+  const index = g.currentIndex || 0;
+  const question = g.questionData || q(index);
+
+  const ps = await get(ref(db,"players"));
+  const ans = await get(ref(db,`answers/${index}`));
+
+  const playerData = ps.val() || {};
+  const answerData = ans.val() || {};
+
+  const positionsBefore = Object.entries(playerData).map(([id,p])=>({
+    id,
+    name:p.name,
+    color:p.color,
+    position:p.position || 0
+  }));
+
+  const rows = Object.entries(answerData).map(([playerId, a])=>{
+    const p = playerData[playerId] || {};
+    return {
+      playerId,
+      name: p.name || a.name || "Sin nombre",
+      answer: a.answer,
+      answerLabel: optionLabel(question, a.answer),
+      time: a.time || 0,
+      correct: a.answer === question.correct,
+      points: 0,
+      correctOrder: null
+    };
+  }).sort((a,b)=>a.time-b.time);
+
+  const updates = {};
+  const positionsAfterMap = {};
+
+  Object.entries(playerData).forEach(([id,p])=>{
+    positionsAfterMap[id] = {
+      id,
+      name:p.name,
+      color:p.color,
+      position:p.position || 0
+    };
+  });
+
+  rows.filter(r=>r.correct).forEach((row,i)=>{
+    const pts = pointsFor(i);
+    const p = playerData[row.playerId] || {};
+    const newPosition = Math.min(QUESTIONS.length, (p.position || 0) + 1);
+
+    row.points = pts;
+    row.correctOrder = i + 1;
+
+    updates[`players/${row.playerId}/score`] = (p.score || 0) + pts;
+    updates[`players/${row.playerId}/position`] = newPosition;
+
+    if(positionsAfterMap[row.playerId]){
+      positionsAfterMap[row.playerId].position = newPosition;
+    }
+  });
+
+  const positionsAfter = Object.values(positionsAfterMap);
+
+  updates[`results/${index}`] = {
+    questionId: question.id,
+    question: question.question,
+    correct: question.correct,
+    correctLabel: optionLabel(question, question.correct),
+    verse: question.verse || "",
+    rows,
+    positionsBefore,
+    positionsAfter,
+    createdAt: Date.now()
+  };
+
+  updates["game/state"] = "results";
+  updates["game/updatedAt"] = Date.now();
+
+  await update(ref(db), updates);
+}
+
+async function closeModal(){
+  const snap = await get(ref(db,"game"));
+  const g = snap.val() || {};
+  if(g.state !== "results") return alert("La modal solo se cierra después de revelar y puntuar.");
+  await update(ref(db,"game"),{
+    state:"board",
+    updatedAt:Date.now()
+  });
+}
+
+async function continueGame(){
+  const snap = await get(ref(db,"game"));
+  const g = snap.val() || {};
+  if(g.state !== "board") return alert("Primero cierra la modal y deja que se vea el avance en el tablero.");
+  const next = (g.currentIndex || 0) + 1;
+  if(next >= QUESTIONS.length) return finishGame();
+  await startCountdown(next);
+}
+
+async function finishGame(){
+  const ps = await get(ref(db,"players"));
+  const ranked = rank(ps.val() || {});
+  const anyReached = ranked.some(p => (p.position || 0) >= QUESTIONS.length);
+  await update(ref(db,"game"),{
+    state:"finished",
+    finalType:anyReached ? "victory" : "journey",
+    winnerName: ranked[0]?.name || "",
+    finishedAt: Date.now(),
+    updatedAt: Date.now()
+  });
+}
+
+function render(){
+  const ranked = rank(players);
+  playerList.innerHTML = ranked.length ? ranked.map((p,i)=>`
+    <div class="player-row">
+      <span>${medal(i)}</span>
+      <span class="dot" style="background:${p.color||"#fff"}"></span>
+      <strong>${p.name}</strong>
+      <span class="points">${p.score||0} pts · ${p.position||0}/${QUESTIONS.length}</span>
+    </div>
+  `).join("") : `<div class="notice">No hay participantes.</div>`;
+
+  const question = game.questionData || q(game.currentIndex || 0);
+  questionInfo.innerHTML = question ? `
+    <strong>Pregunta ${(game.currentIndex||0)+1} de ${QUESTIONS.length}</strong><br>
+    ${question.question}<br>
+    <span class="small">Correcta: ${question.correct}) ${optionLabel(question, question.correct)} · ${question.verse || ""}</span>
+  ` : "Sin pregunta";
+
+  const currentAnswers = answers?.[game.currentIndex || 0] || {};
+  const rows = Object.entries(currentAnswers).sort((a,b)=>(a[1].time||0)-(b[1].time||0));
+  answerList.innerHTML = rows.length ? rows.map(([pid,a],i)=>`
+    <div class="answer-row">
+      <strong>${i+1}°</strong>
+      <span>${players[pid]?.name || a.name || "Sin nombre"}</span>
+      <span style="margin-left:auto">${a.answer}</span>
+    </div>
+  `).join("") : `<div class="notice">Aún no hay respuestas.</div>`;
+
+  stateInfo.innerHTML = `
+    <strong>Estado:</strong> ${game.state || "lobby"}<br>
+    <strong>Pregunta:</strong> ${(game.currentIndex || 0)+1}/${QUESTIONS.length}<br>
+    <strong>Participantes:</strong> ${Object.keys(players).length}<br>
+    <strong>Pregunta segundos:</strong> ${QUESTION_SECONDS}<br>
+    <strong>Cuenta regresiva:</strong> ${COUNTDOWN_SECONDS}
+  `;
+}
+
+document.getElementById("lobby").onclick = openLobby;
+document.getElementById("reset").onclick = resetAll;
+document.getElementById("start").onclick = startGame;
+document.getElementById("reveal").onclick = revealAndScore;
+document.getElementById("closeModal").onclick = closeModal;
+document.getElementById("continue").onclick = continueGame;
+document.getElementById("finish").onclick = finishGame;
+
+onValue(ref(db,".info/serverTimeOffset"), s=>{
+  serverOffset = s.val() || 0;
+});
+
+onValue(ref(db,"game"), s=>{ game = s.val() || {state:"lobby", currentIndex:0}; render(); });
+onValue(ref(db,"players"), s=>{ players = s.val() || {}; render(); });
+onValue(ref(db,"answers"), s=>{ answers = s.val() || {}; render(); });
+</script>
+</body>
+</html>

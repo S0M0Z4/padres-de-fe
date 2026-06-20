@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>Jugador · Ruta de Fe</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body class="player-body">
+  <div class="player-wrap">
+    <div class="player-card">
+      <div class="card">
+        <h1 style="font-size:40px;margin-top:0;">🛤️ Ruta de Fe</h1>
+        <div id="view"></div>
+      </div>
+    </div>
+  </div>
+
+<script type="module">
+import { db, ref, set, get, push, onValue } from "./js/firebase-config.js";
+import { QUESTIONS } from "./js/questions.js";
+import { PIN, COLORS, q, optionLabel, cleanText } from "./js/shared.js";
+
+const view = document.getElementById("view");
+
+let game = { state:"lobby" };
+let player = null;
+let playerId = localStorage.getItem("rutaFePlayerId");
+let answers = {};
+let results = {};
+let currentScreen = "";
+let lastKey = "";
+let selectedColor = localStorage.getItem("rutaFeColor") || COLORS[0];
+
+// REGLA PRINCIPAL:
+// El player NO tiene temporizador propio.
+// El player NO decide cuánto dura la pregunta.
+// El player solo lee game.state, questionStartsAt y answerEndsAt desde Firebase.
+let serverOffset = 0;
+function syncedNow(){
+  return Date.now() + serverOffset;
+}
+function syncedSecondsLeft(target){
+  return Math.max(0, Math.ceil(((target || syncedNow()) - syncedNow()) / 1000));
+}
+
+function setScreen(key, html){
+  if(currentScreen === key) return;
+  currentScreen = key;
+  lastKey = "";
+  view.innerHTML = html;
+}
+
+function answerNow(){
+  return playerId ? answers?.[game.currentIndex]?.[playerId] : null;
+}
+
+function colorButton(color){
+  const selected = color === selectedColor ? "selected" : "";
+  return `<button
+    type="button"
+    class="color-choice ${selected}"
+    data-color="${color}"
+    style="background:${color}"
+    aria-label="Elegir color ${color}">
+  </button>`;
+}
+
+function login(){
+  setScreen("login", `
+    <div class="notice">Ingresa como pareja padre e hija.</div>
+
+    <label>PIN</label>
+    <input id="pinInput" value="${PIN}" inputmode="numeric" autocomplete="off">
+
+    <label style="display:block;margin-top:12px;">Nombre de la pareja</label>
+    <input id="nameInput" placeholder="Ej. Carlos y Ana" maxlength="42" autocomplete="name">
+
+    <label style="display:block;margin-top:14px;">Elige tu color</label>
+    <div class="color-picker">
+      ${COLORS.slice(0, 12).map(colorButton).join("")}
+    </div>
+
+    <div class="notice" style="margin-top:12px;">
+      Tu ficha en el tablero será de este color:
+      <span class="dot" id="previewColor" style="background:${selectedColor};display:inline-block;vertical-align:middle;margin-left:6px;"></span>
+    </div>
+
+    <button class="btn-green" id="join" style="width:100%;margin-top:14px;">Entrar</button>
+  `);
+
+  document.querySelectorAll("[data-color]").forEach(btn=>{
+    btn.onclick = () => {
+      selectedColor = btn.dataset.color;
+      localStorage.setItem("rutaFeColor", selectedColor);
+
+      document.querySelectorAll("[data-color]").forEach(b => b.classList.remove("selected"));
+      btn.classList.add("selected");
+
+      const preview = document.getElementById("previewColor");
+      if(preview) preview.style.background = selectedColor;
+    };
+  });
+
+  const joinBtn = document.getElementById("join");
+  if(joinBtn) joinBtn.onclick = join;
+}
+
+async function join(){
+  const pin = cleanText(document.getElementById("pinInput")?.value);
+  const name = cleanText(document.getElementById("nameInput")?.value);
+
+  if(pin !== PIN) return alert("PIN incorrecto.");
+  if(!name) return alert("Escribe el nombre de la pareja.");
+
+  const snap = await get(ref(db,"players"));
+  const current = snap.val() || {};
+
+  const color = selectedColor || COLORS[Object.keys(current).length % COLORS.length];
+
+  const newRef = push(ref(db,"players"));
+  playerId = newRef.key;
+  localStorage.setItem("rutaFePlayerId", playerId);
+  localStorage.setItem("rutaFeColor", color);
+
+  await set(newRef, {
+    name,
+    color,
+    score:0,
+    position:0,
+    joinedAt:syncedNow()
+  });
+
+  currentScreen = "";
+
+  onValue(ref(db,"players/"+playerId), s=>{
+    player = s.val();
+    render(true);
+  });
+}
+
+async function send(value){
+  if(!playerId || !player) return;
+
+  // El player solo puede responder si Firebase dice que la pregunta está activa.
+  if(game.state !== "question") return;
+
+  const now = syncedNow();
+
+  // Durante la pantalla de 3 segundos no se puede contestar.
+  if(now < (game.questionStartsAt || 0)){
+    currentScreen = "";
+    render(true);
+    return;
+  }
+
+  // Al llegar a 0, se bloquea inmediatamente.
+  if(now >= (game.answerEndsAt || 0)){
+    currentScreen = "";
+    render(true);
+    return;
+  }
+
+  if(answerNow()) return;
+
+  await set(ref(db,`answers/${game.currentIndex}/${playerId}`),{
+    answer:value,
+    name:player.name,
+    time:syncedNow()
+  });
+
+  currentScreen = "";
+  render(true);
+}
+
+function waiting(){
+  setScreen("waiting", `
+    <div class="notice">Ya estás dentro como:</div>
+    <h2>${player?.name || "Participante"}</h2>
+    <div class="player-row" style="margin:12px 0;">
+      <span class="dot" style="background:${player?.color || selectedColor || "#fff"}"></span>
+      <strong>Tu color de ficha</strong>
+    </div>
+    <span class="status">Esperando al moderador...</span>
+  `);
+}
+
+function countdown(){
+  const left = syncedSecondsLeft(game.questionStartsAt);
+
+  setScreen("countdown-" + game.currentIndex, `
+    <div style="text-align:center;">
+      <span class="status">Prepárate</span>
+      <h2>Siguiente pregunta</h2>
+      <div class="countdown">
+        <div>
+          <div id="countNum" class="n" style="font-size:110px">${left}</div>
+        </div>
+      </div>
+      <p class="small">Aún no puedes responder.</p>
+    </div>
+  `);
+
+  if(lastKey !== "c" + left){
+    lastKey = "c" + left;
+    const el = document.getElementById("countNum");
+    if(el) el.textContent = left;
+  }
+}
+
+function question(){
+  const questionData = game.questionData || q(game.currentIndex || 0);
+  const sent = answerNow();
+
+  if(sent){
+    setScreen("answered", `
+      <div class="notice">✅ Respuesta enviada</div>
+      <h2>${sent.answer}) ${optionLabel(questionData, sent.answer)}</h2>
+      <span class="status">Espera el resultado.</span>
+    `);
+    return;
+  }
+
+  const now = syncedNow();
+
+  // No mostrar opciones antes de que Firebase indique que empezó.
+  if(now < (game.questionStartsAt || 0)){
+    return countdown();
+  }
+
+  const left = syncedSecondsLeft(game.answerEndsAt);
+
+  // Al llegar a 0, se bloquean las opciones.
+  if(left <= 0 || now >= (game.answerEndsAt || 0)){
+    setScreen("timeup-" + game.currentIndex, `
+      <div class="notice">⏳ Tiempo terminado</div>
+      <h2>Ya no se puede contestar.</h2>
+      <p>Espera a que el moderador revele la respuesta.</p>
+    `);
+    return;
+  }
+
+  const buttons = questionData.type === "boolean"
+    ? [["V","Verdadero","v"],["F","Falso","f"]]
+    : [["A",questionData.options.A,"a"],["B",questionData.options.B,"b"],["C",questionData.options.C,"c"],["D",questionData.options.D,"d"]];
+
+  setScreen("question-" + game.currentIndex, `
+    <div class="category">Pregunta ${(game.currentIndex||0)+1} de ${QUESTIONS.length}</div>
+    <h2 style="font-size:28px">${questionData.question}</h2>
+    <div id="playerTimer" class="timer">⏳ ${left}</div>
+    ${buttons.map(([key,text,cls])=>`<button class="opt player-option ${cls}" data-a="${key}"><b>${key}</b> ${text}</button>`).join("")}
+  `);
+
+  if(lastKey !== "q" + left){
+    lastKey = "q" + left;
+    const timer = document.getElementById("playerTimer");
+    if(timer) timer.textContent = `⏳ ${left}`;
+  }
+
+  document.querySelectorAll("[data-a]").forEach(b=>b.onclick=()=>send(b.dataset.a));
+}
+
+function result(){
+  const questionData = game.questionData || q(game.currentIndex || 0);
+  const row = results?.[game.currentIndex]?.rows?.find(r=>r.playerId===playerId);
+
+  if(!row){
+    setScreen("result-no", `
+      <div class="notice">Respuesta revelada</div>
+      <h2>Correcta: ${questionData.correct}) ${optionLabel(questionData, questionData.correct)}</h2>
+      <p>No registraste respuesta.</p>
+    `);
+  }else{
+    setScreen("result-" + game.currentIndex, `
+      <div class="notice">${row.correct ? "✅ Correcto" : "❌ Incorrecto"}</div>
+      <h2>Correcta: ${questionData.correct}) ${optionLabel(questionData, questionData.correct)}</h2>
+      <p style="font-size:24px;font-weight:900">${row.correct ? "+"+row.points+" puntos" : "0 puntos"}</p>
+      <p class="small">${questionData.verse || ""}</p>
+    `);
+  }
+}
+
+function final(){
+  setScreen("final", `
+    <div style="text-align:center;">
+      <div class="final-title" style="font-size:52px;">🏁 Final</div>
+      <h2>${player?.name || ""}</h2>
+      <p style="font-size:24px;font-weight:900">${player?.score || 0} puntos</p>
+      <p>Casillas avanzadas: ${player?.position || 0}/${QUESTIONS.length}</p>
+    </div>
+  `);
+}
+
+function render(force=false){
+  // Mientras no haya jugador, no se redibuja el formulario en cada actualización.
+  if(!playerId || !player) return login();
+
+  if(force) currentScreen = "";
+
+  if(game.state === "lobby") return waiting();
+  if(game.state === "countdown") return countdown();
+  if(game.state === "question") return question();
+  if(game.state === "results") return result();
+  if(game.state === "board") return result();
+  if(game.state === "finished") return final();
+
+  waiting();
+}
+
+if(playerId){
+  onValue(ref(db,"players/"+playerId), s=>{
+    player = s.val();
+    if(!player){
+      localStorage.removeItem("rutaFePlayerId");
+      playerId = null;
+      currentScreen = "";
+    }
+    render(true);
+  });
+}else{
+  login();
+}
+
+onValue(ref(db,".info/serverTimeOffset"), s=>{
+  serverOffset = s.val() || 0;
+  if(playerId && player) render();
+});
+
+onValue(ref(db,"game"), s=>{
+  game = s.val() || {state:"lobby"};
+
+  // El estado global de Firebase manda. No se inicia ninguna pregunta localmente.
+  if(playerId && player) currentScreen = "";
+
+  render();
+});
+
+onValue(ref(db,"answers"), s=>{
+  answers = s.val() || {};
+  if(playerId && player) currentScreen = "";
+  render();
+});
+
+onValue(ref(db,"results"), s=>{
+  results = s.val() || {};
+  if(playerId && player) currentScreen = "";
+  render();
+});
+
+// Este intervalo NO inicia ningún temporizador.
+// Solo refresca la pantalla para mostrar los segundos calculados desde Firebase.
+setInterval(()=>{
+  if(playerId && player) render();
+}, 250);
+</script>
+</body>
+</html>
